@@ -485,6 +485,113 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// A vertex shader writing SV_RenderTargetArrayIndex and
+    /// SV_ViewportArrayIndex. On GFX9 and later both travel in z of the misc
+    /// vector (`pos1`: the index in z[10:0], the viewport in z[19:16]), and
+    /// the clip distances move to `pos2`. Without the misc vector `pos1`
+    /// carries the clip distances. DXC sets ShaderFlags bit 9 and
+    /// D3D_SHADER_FEATURE_VIEWPORT_AND_RT_ARRAY_INDEX_FROM_ANY_SHADER_FEEDING_RASTERIZER
+    /// (0x2000) in SFI0 for a vertex shader with either output.
+    #[test]
+    fn render_target_and_viewport_index_exports_lower() {
+        let el = |name: &str, kind, comp, row, col, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let pos = el("SV_Position", 3, 9, 0, 0, 4);
+        let clip = el("SV_ClipDistance", 6, 9, 2, 0, 1);
+        let rt = el("SV_RenderTargetArrayIndex", 4, 5, 1, 0, 1);
+        let vp = el("SV_ViewportArrayIndex", 5, 5, 1, 1, 1);
+        let head = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0x7E02_02F2,    // v_mov_b32 v1, 1.0
+            0x7E04_02F2,    // v_mov_b32 v2, 1.0
+            0x7E06_02F2,    // v_mov_b32 v3, 1.0
+            0x7E08_02FF,    // v_mov_b32 v4, 0x20003 (index 3, viewport 2)
+            0x0002_0003,
+            0x7E0A_02F0, // v_mov_b32 v5, 0.5
+            0xF800_00CF,
+            0x0302_0100, // exp pos0 v0, v1, v2, v3
+        ];
+        let misc = [
+            0xF800_00D4u32,
+            0x0004_0000, // exp pos1 off, off, v4, off
+            0xF800_08E1,
+            0x0000_0005, // exp pos2 v5, off, off, off done
+            0xBF81_0000,
+        ];
+        let plain = [
+            0xF800_08D1u32,
+            0x0000_0005, // exp pos1 v5, off, off, off done
+            0xBF81_0000,
+        ];
+        let cases: [(&[u32], Vec<SigElement>, bool); 2] = [
+            (&misc, vec![pos.clone(), rt, vp, clip.clone()], true),
+            (&plain, vec![pos, clip], false),
+        ];
+        for (tail, outputs, indexed) in cases {
+            let words: Vec<u32> = head.iter().chain(tail).copied().collect();
+            let native = NativeProgram {
+                stage: HwStage::Vs,
+                wave64: false,
+                vgprs: 6,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Vs {
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = container::signature(&outputs, false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            let host = Container::parse(&out.dxil).unwrap();
+            // Which components each output writes, by system value (OSG1
+            // rows: the system value at byte 12, the never-written mask at
+            // byte 25).
+            let sig = host.part(FourCC::OSG1).unwrap().data;
+            let count = u32::from_le_bytes(sig[0..4].try_into().unwrap()) as usize;
+            let written = |sv: u32| {
+                (0..count).find_map(|i| {
+                    let row = &sig[8 + 32 * i..8 + 32 * (i + 1)];
+                    (u32::from_le_bytes(row[12..16].try_into().unwrap()) == sv)
+                        .then_some(row[24] & !row[25])
+                })
+            };
+            assert_eq!(written(1), Some(0xF), "position");
+            assert_eq!(written(2), Some(0x1), "clip distance (indexed: {indexed})");
+            let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            if indexed {
+                assert_eq!(written(4), Some(0x1), "render-target index");
+                assert_eq!(written(5), Some(0x2), "viewport index");
+                assert_ne!(features & 0x2000, 0, "SFI0 {features:#x}");
+            } else {
+                assert_eq!(features & 0x2000, 0, "SFI0 {features:#x}");
+            }
+        }
+    }
+
     /// A wave64 compute program that writes only EXEC's high dword
     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask is
     /// opaque and keyed by the unchanged low dword, so building its lane bit

@@ -6516,6 +6516,9 @@ impl<'a> Lower<'a> {
         // (output element, channel) per exported channel; per-primitive
         // outputs are elements of `prims`.
         let mut stores = Vec::new();
+        // Outputs packed as bit fields of one exported channel: (output
+        // element, value, shift, mask).
+        let mut fields = Vec::new();
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
         let outputs = if primitive {
             &self.s.prims
@@ -6550,7 +6553,7 @@ impl<'a> Lower<'a> {
                     });
                     if let Some(id) = found {
                         let col = src.expect("found").1 - outputs[id].col;
-                        stores.push((id, col, value, Some(high)));
+                        stores.push((id, col, value, Some(high), None));
                     }
                 }
             }
@@ -6589,12 +6592,29 @@ impl<'a> Lower<'a> {
                         .map(|id| (id, ch - outputs[id].col))
                 }
                 Target::Null | Target::Unread => None,
-                Target::Position(n @ 1..=2) => {
-                    // shortcut: without the misc vector (point size, render
-                    // target or viewport index) pos1 and pos2 carry the clip
-                    // then cull distances, in semantic order.
-                    if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
-                        return Err("render-target or viewport index exports");
+                Target::Position(n @ 1..=3) => {
+                    // pos1 is the misc vector when the program writes a
+                    // render-target or viewport index (`VS_OUT_MISC_VEC_ENA`);
+                    // the clip then cull distances follow it, in semantic
+                    // order. shortcut: a point size or edge flag alone (no
+                    // host output) is taken not to enable it.
+                    let misc = outputs.iter().any(|o| matches!(o.kind, 4 | 5));
+                    if misc && n == 1 {
+                        // GFX9 and later: the render-target index in
+                        // z[10:0], the viewport index in z[19:16]. x (point
+                        // size), y (edge flag) and w have no host output.
+                        if ch == 2 {
+                            for (kind, shift, mask) in [(4, 0, 0x7FF), (5, 16, 0xF)] {
+                                if let Some(id) = by_kind(kind) {
+                                    fields.push((id, value, shift, mask));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let first = if misc { 2 } else { 1 };
+                    if n - first > 1 {
+                        return Err("clip, cull or point-size exports");
                     }
                     let mut dists: Vec<usize> = (0..outputs.len())
                         .filter(|&i| matches!(outputs[i].kind, 6 | 7))
@@ -6606,15 +6626,18 @@ impl<'a> Lower<'a> {
                         .collect();
                     // Channels past the distances the signature declares are
                     // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
-                    let k = usize::from(n - 1) * 4 + usize::from(ch);
+                    let k = usize::from(n - first) * 4 + usize::from(ch);
                     flat.get(k).copied()
                 }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
+                stores.push((id, col, value, None, None));
             }
+        }
+        for (id, value, shift, mask) in fields {
+            stores.push((id, 0, value, None, Some((shift, mask))));
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
             if primitive {
@@ -6640,8 +6663,14 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
-        for (id, col, value, half) in stores {
+        for (id, col, value, half, field) in stores {
             let mut x = self.i32_of(value)?;
+            if let Some((shift, mask)) = field {
+                let c = self.cur;
+                let (shift, mask) = (self.s.m.i32(shift), self.s.m.i32(mask));
+                let v = self.s.m.bin(c, Bin::LShr, x, shift);
+                x = self.s.m.bin(c, Bin::And, v, mask);
+            }
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
@@ -6658,7 +6687,7 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() || field.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
